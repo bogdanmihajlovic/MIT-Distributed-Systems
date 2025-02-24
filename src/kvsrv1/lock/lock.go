@@ -33,19 +33,29 @@ func MakeLock(ck kvtest.IKVClerk, l string) *Lock {
 }
 
 func (lk *Lock) Acquire() {
+
 	for {
 		val, ver, err := lk.ck.Get(lk.lockKey)
 
 		if err == rpc.ErrNoKey {
 			err = lk.ck.Put(lk.lockKey, lk.lockValue, 0)
+
 			if err == rpc.OK {
 				return
 			}
-		} else if err == rpc.OK && val == "" {
+		}
+
+		if err != rpc.OK {
+			continue
+		}
+
+		if val == "" {
 			err = lk.ck.Put(lk.lockKey, lk.lockValue, ver)
 			if err == rpc.OK {
 				return
 			}
+		} else if val == lk.lockValue {
+			return
 		}
 
 		time.Sleep(100 * time.Millisecond)
@@ -56,12 +66,19 @@ func (lk *Lock) Release() {
 	for {
 		val, ver, err := lk.ck.Get(lk.lockKey)
 
-		if err == rpc.OK && val == lk.lockValue {
+		if err != rpc.OK {
+			continue
+		}
+
+		if val == lk.lockValue {
 			err = lk.ck.Put(lk.lockKey, "", ver)
 			if err == rpc.OK {
 				return
 			}
+		} else if val == "" {
+			return
 		}
-		time.Sleep(10 * time.Millisecond)
+
+		time.Sleep(100 * time.Millisecond)
 	}
 }
