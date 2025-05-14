@@ -8,6 +8,7 @@ package raft
 
 import (
 	//	"bytes"
+
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -16,9 +17,16 @@ import (
 	//	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
-	"6.5840/tester1"
+	tester "6.5840/tester1"
 )
 
+type RaftState int
+
+const (
+	Leader RaftState = iota
+	Candidate
+	Follower
+)
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
@@ -31,7 +39,13 @@ type Raft struct {
 	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	currentState RaftState
 
+	electionTimeout time.Duration
+	lastElection    time.Time
+
+	currentTerm int
+	votedFor    int
 }
 
 // return currentTerm and whether this server
@@ -41,6 +55,15 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (3A).
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	term = rf.currentTerm
+	if rf.currentState == Leader {
+		isleader = true
+	} else {
+		isleader = false
+	}
 	return term, isleader
 }
 
@@ -61,7 +84,6 @@ func (rf *Raft) persist() {
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
 }
-
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
@@ -90,7 +112,6 @@ func (rf *Raft) PersistBytes() int {
 	return rf.persister.RaftStateSize()
 }
 
-
 // the service says it has created a snapshot that has
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
@@ -100,22 +121,58 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
+type AppendEntriesArgs struct {
+	LeaderTerm int
+	LeaderId   int
+}
+
+type AppendEntriesReply struct {
+	Term int
+}
 
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 type RequestVoteArgs struct {
-	// Your data here (3A, 3B).
+	Term        int
+	CandidateId int
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
-	// Your data here (3A).
+	Term        int
+	VoteGranted bool
 }
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply.Term = rf.currentTerm
+	reply.VoteGranted = false
+
+	if args.Term < rf.currentTerm {
+		return
+	}
+
+	if args.Term > rf.currentTerm {
+		rf.currentState = Follower
+		rf.votedFor = -1
+		rf.currentTerm = args.Term
+	}
+
+	if rf.votedFor < 0 || rf.votedFor == args.CandidateId {
+		reply.VoteGranted = true
+		rf.votedFor = args.CandidateId
+	}
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.lastElection = time.Now()
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -150,7 +207,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -170,8 +226,89 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (3B).
 
-
 	return index, term, isLeader
+}
+
+func (rf *Raft) sendAppendEntries() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	args := AppendEntriesArgs{
+		LeaderTerm: rf.currentTerm,
+		LeaderId:   rf.me,
+	}
+
+	for i, _ := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+
+		go func(peerId int) {
+			reply := AppendEntriesReply{}
+			rf.peers[peerId].Call("Raft.AppendEntries", &args, &reply)
+		}(i)
+	}
+}
+
+func (rf *Raft) startElection() {
+	rf.mu.Lock()
+	//defer rf.mu.Unlock()
+	rf.currentState = Candidate
+	rf.currentTerm++
+	rf.votedFor = rf.me
+	// send RequestVote to all other servers
+
+	voteArgs := RequestVoteArgs{
+		Term:        rf.currentTerm,
+		CandidateId: rf.me,
+	}
+
+	voteResultChanel := make(chan bool)
+	rf.mu.Unlock()
+	for i, _ := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		go func(peerId int) {
+			voteReply := RequestVoteReply{
+				Term:        0,
+				VoteGranted: false,
+			}
+			ok := rf.sendRequestVote(peerId, &voteArgs, &voteReply)
+			if ok {
+				voteResultChanel <- voteReply.VoteGranted
+			} else {
+				voteResultChanel <- false
+			}
+		}(i)
+	}
+
+	voteReceived := 1
+	voteGranted := 1
+	for {
+		//fmt.Printf("Waiting for result %d\n", rf.me)
+		result := <-voteResultChanel
+		voteReceived++
+		if result {
+			voteGranted++
+		}
+
+		if voteGranted > len(rf.peers)/2 || voteReceived >= len(rf.peers) {
+			break
+		}
+	}
+	rf.mu.Lock()
+	if rf.currentState != Candidate {
+		rf.mu.Unlock()
+		return
+	}
+
+	if voteGranted > len(rf.peers)/2 {
+		rf.currentState = Leader
+		rf.lastElection = time.Now()
+		go rf.sendAppendEntries()
+	}
+	rf.mu.Unlock()
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -193,12 +330,32 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+func (rf *Raft) pastElectionTimeout() bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	return time.Since(rf.lastElection) > rf.electionTimeout
+}
+
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
 
 		// Your code here (3A)
 		// Check if a leader election should be started.
+		rf.mu.Lock()
+		state := rf.currentState
+		rf.mu.Unlock()
 
+		switch state {
+		case Follower:
+			fallthrough
+		case Candidate:
+			if rf.pastElectionTimeout() {
+				rf.startElection()
+			}
+		case Leader:
+			DPrintf("I am %d Leader", rf.me)
+		}
 
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
@@ -223,6 +380,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 
+	rf.currentState = Follower
+	rf.currentTerm = 1
+	rf.votedFor = -1
+	rf.electionTimeout = time.Duration(300+(rand.Int63()%300)) * time.Millisecond
 	// Your initialization code here (3A, 3B, 3C).
 
 	// initialize from state persisted before a crash
@@ -230,7 +391,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-
 
 	return rf
 }
