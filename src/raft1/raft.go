@@ -44,6 +44,9 @@ type Raft struct {
 	electionTimeout time.Duration
 	lastElection    time.Time
 
+	heartbeatTimeout time.Duration
+	lastHeartbeat    time.Time
+
 	currentTerm int
 	votedFor    int
 }
@@ -163,9 +166,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 	}
 
-	if rf.votedFor < 0 || rf.votedFor == args.CandidateId {
+	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
+		rf.lastElection = time.Now()
 	}
 }
 
@@ -252,19 +256,17 @@ func (rf *Raft) sendAppendEntries() {
 
 func (rf *Raft) startElection() {
 	rf.mu.Lock()
-	//defer rf.mu.Unlock()
+	defer rf.mu.Unlock()
 	rf.currentState = Candidate
 	rf.currentTerm++
 	rf.votedFor = rf.me
-	// send RequestVote to all other servers
+	voteGranted := 1
 
 	voteArgs := RequestVoteArgs{
 		Term:        rf.currentTerm,
 		CandidateId: rf.me,
 	}
-
-	voteResultChanel := make(chan bool)
-	rf.mu.Unlock()
+	// send RequestVote to all other servers
 	for i, _ := range rf.peers {
 		if i == rf.me {
 			continue
@@ -275,40 +277,27 @@ func (rf *Raft) startElection() {
 				VoteGranted: false,
 			}
 			ok := rf.sendRequestVote(peerId, &voteArgs, &voteReply)
-			if ok {
-				voteResultChanel <- voteReply.VoteGranted
-			} else {
-				voteResultChanel <- false
+
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			if !ok || !voteReply.VoteGranted {
+				return
 			}
+
+			// if voteReply.Term < rf.currentTerm {
+			// 	return
+			// }
+			voteGranted++
+
+			if voteGranted <= len(rf.peers)/2 || rf.currentState != Candidate {
+				return
+			}
+
+			rf.currentState = Leader
+			rf.lastElection = time.Now()
+			go rf.sendAppendEntries()
 		}(i)
 	}
-
-	voteReceived := 1
-	voteGranted := 1
-	for {
-		//fmt.Printf("Waiting for result %d\n", rf.me)
-		result := <-voteResultChanel
-		voteReceived++
-		if result {
-			voteGranted++
-		}
-
-		if voteGranted > len(rf.peers)/2 || voteReceived >= len(rf.peers) {
-			break
-		}
-	}
-	rf.mu.Lock()
-	if rf.currentState != Candidate {
-		rf.mu.Unlock()
-		return
-	}
-
-	if voteGranted > len(rf.peers)/2 {
-		rf.currentState = Leader
-		rf.lastElection = time.Now()
-		go rf.sendAppendEntries()
-	}
-	rf.mu.Unlock()
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -330,10 +319,15 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+func (rf *Raft) pastHeartbeatTimeout() bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return time.Since(rf.lastHeartbeat) > rf.heartbeatTimeout
+}
+
 func (rf *Raft) pastElectionTimeout() bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
 	return time.Since(rf.lastElection) > rf.electionTimeout
 }
 
@@ -354,12 +348,14 @@ func (rf *Raft) ticker() {
 				rf.startElection()
 			}
 		case Leader:
-			DPrintf("I am %d Leader", rf.me)
+			if rf.pastHeartbeatTimeout() {
+				rf.sendAppendEntries()
+			}
 		}
 
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
-		ms := 50 + (rand.Int63() % 300)
+		ms := 100
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
@@ -381,9 +377,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	rf.currentState = Follower
-	rf.currentTerm = 1
+	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.electionTimeout = time.Duration(300+(rand.Int63()%300)) * time.Millisecond
+	rf.heartbeatTimeout = 150 * time.Millisecond
+
 	// Your initialization code here (3A, 3B, 3C).
 
 	// initialize from state persisted before a crash
